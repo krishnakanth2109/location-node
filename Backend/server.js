@@ -7,34 +7,53 @@ require('dotenv').config();
 
 // --- App Initialization ---
 const app = express();
-app.use(cors());
+
+// --- CORS CONFIGURATION (Updated) ---
+// We allow your Netlify URL and Localhost (for testing)
+const allowedOrigins = [
+  'https://location-tracker56.netlify.app', // Your deployed Frontend
+  'http://localhost:3000',                    // React Localhost
+  'http://localhost:5173'                     // Vite Localhost (just in case)
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  }
+}));
+
 app.use(express.json());
+
+// Render sets the PORT env variable automatically
 const PORT = process.env.PORT || 5000;
 
 // --- Database Connection ---
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('MongoDB Connected...'))
-.catch(err => console.error('MongoDB Connection Error:', err));
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('MongoDB Connected...'))
+  .catch(err => {
+      console.error('MongoDB Connection Error:', err);
+      process.exit(1); 
+  });
 
-// --- Mongoose Schemas (Data Models) ---
-
-// MODIFIED: User Schema now includes a 'role' field.
+// --- Mongoose Schemas ---
 const UserSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   role: { 
     type: String, 
-    enum: ['employee', 'admin'], // Role can only be one of these two values
-    default: 'employee'          // New users are employees by default
+    enum: ['employee', 'admin'], 
+    default: 'employee'
   }
 });
 const User = mongoose.model('User', UserSchema);
 
-// UNCHANGED: Trip Schema remains the same.
 const TripSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   startTime: { type: Date, required: true },
@@ -45,9 +64,7 @@ const TripSchema = new mongoose.Schema({
 const Trip = mongoose.model('Trip', TripSchema);
 
 
-// --- Authentication & Authorization Middlewares ---
-
-// This middleware checks if a user is logged in by verifying their token.
+// --- Middlewares ---
 const authMiddleware = (req, res, next) => {
   const token = req.header('x-auth-token');
   if (!token) {
@@ -55,16 +72,14 @@ const authMiddleware = (req, res, next) => {
   }
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded.user; // Adds user payload { id, role } to the request
+    req.user = decoded.user; 
     next();
   } catch (err) { 
     res.status(401).json({ msg: 'Token is not valid' }); 
   }
 };
 
-// NEW: This middleware checks if the logged-in user has the 'admin' role.
 const adminMiddleware = (req, res, next) => {
-  // This middleware should run AFTER authMiddleware
   if (req.user && req.user.role === 'admin') {
     next();
   } else {
@@ -75,18 +90,16 @@ const adminMiddleware = (req, res, next) => {
 
 // --- API ROUTES ---
 
-// --- Authentication Routes (Public) ---
+// 1. Auth Routes
 const authRouter = express.Router();
 
-// @route   POST /api/auth/register
-// @desc    Register a new employee (admins are created separately)
 authRouter.post('/register', async (req, res) => {
   const { name, email, password } = req.body;
   try {
     let user = await User.findOne({ email });
     if (user) return res.status(400).json({ msg: 'User with this email already exists' });
 
-    user = new User({ name, email, password }); // Role defaults to 'employee'
+    user = new User({ name, email, password });
 
     const salt = await bcrypt.genSalt(10);
     user.password = await bcrypt.hash(password, salt);
@@ -103,8 +116,6 @@ authRouter.post('/register', async (req, res) => {
   }
 });
 
-// @route   POST /api/auth/login
-// @desc    Authenticate any user (admin or employee) & get token
 authRouter.post('/login', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -114,7 +125,6 @@ authRouter.post('/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
 
-    // MODIFIED: Payload now includes the user's role, which is critical for the frontend.
     const payload = { user: { id: user.id, role: user.role } }; 
 
     jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' }, (err, token) => {
@@ -129,11 +139,10 @@ authRouter.post('/login', async (req, res) => {
 app.use('/api/auth', authRouter);
 
 
-// --- Employee Trip Routes (Protected for any logged-in user) ---
+// 2. Trip Routes
 const tripRouter = express.Router();
-tripRouter.use(authMiddleware); // Apply auth middleware to all routes in this router
+tripRouter.use(authMiddleware);
 
-// @route   POST /api/trips/start
 tripRouter.post('/start', async (req, res) => {
   try {
     const newTrip = new Trip({ user: req.user.id, startTime: new Date() });
@@ -145,7 +154,6 @@ tripRouter.post('/start', async (req, res) => {
   }
 });
 
-// @route   POST /api/trips/stop
 tripRouter.post('/stop', async (req, res) => {
   const { tripId, path, stops } = req.body;
   try {
@@ -167,16 +175,13 @@ tripRouter.post('/stop', async (req, res) => {
 app.use('/api/trips', tripRouter);
 
 
-// --- NEW: Admin Routes (Protected for Admins Only) ---
+// 3. Admin Routes
 const adminRouter = express.Router();
-// IMPORTANT: Routes in this router first check for login, then check for admin role.
 adminRouter.use(authMiddleware, adminMiddleware);
 
-// @route   GET /api/admin/employees
-// @desc    Get a list of all users with the 'employee' role.
 adminRouter.get('/employees', async (req, res) => {
   try {
-    const employees = await User.find({ role: 'employee' }).select('-password'); // Exclude password from result
+    const employees = await User.find({ role: 'employee' }).select('-password');
     res.json(employees);
   } catch (err) { 
     console.error(err.message);
@@ -184,8 +189,6 @@ adminRouter.get('/employees', async (req, res) => {
   }
 });
 
-// @route   GET /api/admin/trips/:employeeId
-// @desc    Get all trips for a specific employee, sorted by most recent.
 adminRouter.get('/trips/:employeeId', async (req, res) => {
   try {
     const trips = await Trip.find({ user: req.params.employeeId }).sort({ startTime: -1 });
@@ -196,7 +199,6 @@ adminRouter.get('/trips/:employeeId', async (req, res) => {
   }
 });
 app.use('/api/admin', adminRouter);
-
 
 // --- Start Server ---
 app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
