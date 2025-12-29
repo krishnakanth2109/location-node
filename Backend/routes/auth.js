@@ -1,103 +1,135 @@
-const express = require('express');
+import express from 'express';
+import axios from 'axios';
+import User from '../models/User.js';
+import Otp from '../models/Otp.js';
+import admin from '../config/firebase.js';
+
 const router = express.Router();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User'); // Ensure this path is correct!
-require('dotenv').config();
 
 // @route   POST api/auth/register
+// @desc    Create User in Firebase & MongoDB (Server-Side)
 router.post('/register', async (req, res) => {
   const { name, email, password, role } = req.body;
 
   try {
-    // 1. Check if Secrets exist
-    if (!process.env.JWT_SECRET) {
-      console.error("FATAL ERROR: JWT_SECRET is not defined in Environment Variables.");
-      return res.status(500).json({ msg: "Server Configuration Error" });
-    }
-
-    // 2. Check if user exists
-    let user = await User.findOne({ email });
-    if (user) {
-      return res.status(400).json({ msg: 'User already exists' });
-    }
-
-    // 3. Create User
-    user = new User({
-      name,
+    // 1. Create User in Firebase
+    const firebaseUser = await admin.auth().createUser({
       email,
       password,
-      role: role || 'employee', // Default to employee if not sent
+      displayName: name,
     });
 
-    const salt = await bcrypt.genSalt(10);
-    user.password = await bcrypt.hash(password, salt);
+    // 2. Create User in MongoDB
+    const user = new User({
+      name,
+      email,
+      firebaseUid: firebaseUser.uid,
+      role: role || 'employee'
+    });
 
     await user.save();
 
-    // 4. Create Token
-    const payload = {
-      user: {
-        id: user.id,
-        role: user.role,
-      },
-    };
-
-    jwt.sign(
-      payload,
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' }, // Increased to 8 hours
-      (err, token) => {
-        if (err) throw err;
-        res.json({ token });
-      }
-    );
+    res.status(201).json({ msg: 'User registered successfully. Please login.' });
   } catch (err) {
-    console.error("Register Route Error:", err.message);
-    res.status(500).send('Server error: ' + err.message);
+    console.error("Register Error:", err);
+    if(err.code === 'auth/email-already-exists') {
+        return res.status(400).json({ msg: 'Email already exists' });
+    }
+    res.status(500).json({ msg: 'Server error', error: err.message });
   }
 });
 
 // @route   POST api/auth/login
+// @desc    Login via Firebase REST API (No Client SDK needed)
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    if (!process.env.JWT_SECRET) {
-      console.error("FATAL ERROR: JWT_SECRET is not defined.");
-      return res.status(500).json({ msg: "Server Configuration Error" });
-    }
+    // 1. Check if mongo user exists first
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ msg: 'Invalid Credentials' });
 
-    let user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ msg: 'Invalid credentials' });
-    }
+    // 2. Exchange Email/Password for ID Token via Firebase REST API
+    const apiKey = process.env.FIREBASE_API_KEY;
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ msg: 'Invalid credentials' });
-    }
+    const response = await axios.post(url, {
+      email,
+      password,
+      returnSecureToken: true
+    });
 
-    const payload = {
+    const { idToken, localId } = response.data;
+
+    // 3. Return Token & User Info
+    res.json({
+      token: idToken,
       user: {
-        id: user.id,
+        id: user._id,
+        name: user.name,
+        email: user.email,
         role: user.role,
-      },
-    };
-
-    jwt.sign(
-      payload,
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' },
-      (err, token) => {
-        if (err) throw err;
-        res.json({ token });
+        firebaseUid: localId
       }
-    );
+    });
+
   } catch (err) {
-    console.error("Login Route Error:", err.message);
-    res.status(500).send('Server error');
+    console.error("Login Error:", err.response ? err.response.data : err.message);
+    res.status(400).json({ msg: 'Invalid Credentials' });
   }
 });
 
-module.exports = router;
+// @route   POST api/auth/forgot-password
+// @desc    Generate OTP for Password Reset
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ msg: 'User not found' });
+
+    // Generate 6 digit OTP
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Save OTP to DB (Expires in 5 mins defined in Model)
+    await Otp.create({ email, otp: otpCode });
+
+    // TODO: Send this OTP via Email Service (Nodemailer)
+    console.log(`[OTP] for ${email}: ${otpCode}`);
+
+    res.json({ msg: 'OTP generated. Check server logs (or email).' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   POST api/auth/reset-password
+// @desc    Verify OTP and Change Password
+router.post('/reset-password', async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+
+  try {
+    // 1. Verify OTP
+    const validOtp = await Otp.findOne({ email, otp });
+    if (!validOtp) return res.status(400).json({ msg: 'Invalid or Expired OTP' });
+
+    // 2. Find User
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ msg: 'User not found' });
+
+    // 3. Update Password in Firebase (Server-Side)
+    await admin.auth().updateUser(user.firebaseUid, {
+      password: newPassword
+    });
+
+    // 4. Delete OTP
+    await Otp.deleteOne({ _id: validOtp._id });
+
+    res.json({ msg: 'Password updated successfully. Please login.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server Error: ' + err.message);
+  }
+});
+
+export default router;
